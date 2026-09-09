@@ -1,0 +1,20 @@
+{
+  "enable_debug_log": false,
+  "port": 8088,
+  "enable_socks5": true,
+  "enable_http": true,
+  "timeout_sec": 10,
+  "write_log": {
+    "enable": false,
+    "path": "./activity.log"
+  },
+  "auth": {
+    "enable": false,
+    "users": [
+      {
+        "username": "user",
+        "password": "pass"
+      }
+    ]
+  }
+}
