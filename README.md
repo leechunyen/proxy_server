@@ -17,7 +17,7 @@ A lightweight, high-performance, dual-protocol proxy server written in Go. It su
 ## Getting Started
 
 ### Prerequisites
-- [Go](https://go.dev/) (1.18+ recommended)
+- [Go](https://go.dev/) (1.25+ recommended)
 
 ### Native Run (Go)
 

@@ -1,6 +1,6 @@
 {
   "enable_debug_log": false,
-  "port": 8088,
+  "port": 1080,
   "enable_socks5": true,
   "enable_http": true,
   "timeout_sec": 10,

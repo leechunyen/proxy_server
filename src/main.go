@@ -188,11 +188,10 @@ func checkAuth(user, pass string, cfg Config) bool {
 
 // Basic auth for HTTP – "Authorization: Basic base64(user:pass)"
 func parseBasicAuth(header string) (user, pass string, ok bool) {
-    const prefix = "Basic "
-    if !strings.HasPrefix(header, prefix) {
+    if len(header) < 6 || !strings.EqualFold(header[:6], "basic ") {
         return "", "", false
     }
-    payload := strings.TrimPrefix(header, prefix)
+    payload := strings.TrimSpace(header[6:])
     decoded, err := base64.StdEncoding.DecodeString(payload)
     if err != nil {
         return "", "", false

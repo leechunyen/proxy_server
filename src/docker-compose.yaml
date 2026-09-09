@@ -1,3 +1,4 @@
+name: proxy_server
 version: '3.8'
 
 services:
@@ -8,18 +9,23 @@ services:
     ports:
       - "1080:1080"
     volumes:
-      # --- 【選項 A】綁定本機目錄 (Bind Mount) ---
-      # 優點：你可以直接在當前目錄的 ./data 裡修改 config.json
-      # (預設啟用此項)
+      # --- [Option A] Bind Mount ---
+      # Benefit: You can directly edit config.json in the local ./data directory.
+      # (Enabled by default)
       - ./data:/app/data
 
-      # --- 【選項 B】使用 Docker 具名卷宗 (Named Volume) ---
-      # 優點：交由 Docker 統一管理資料存放位置，適合正式伺服器部署
-      # (若要使用此項，請取消下方註解，並把上方的 ./data 註解掉)
+      # --- [Option B] Named Volume ---
+      # Benefit: Let Docker manage the data storage location, suitable for production.
+      # (To use this option, uncomment the line below and comment out the ./data line above)
       # - proxy_data:/app/data
+
+    # --- [Network Mode Option] ---
+    # To let the container use the host's network stack directly, uncomment the line below.
+    # Note: You must also comment out the entire 'ports' section above, as host mode does not use port mapping.
+    # network_mode: "host"
 
     restart: unless-stopped
 
-# 若要使用【選項 B】，請將下面兩行的註解取消
+# To use [Option B], uncomment the two lines below
 # volumes:
 #   proxy_data:
