@@ -95,6 +95,21 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
   - `enable`: Set to `true` to enforce username/password authentication for all connections.
   - `users`: An array of JSON objects containing `username` and `password` for authorized clients.
 
+## TLS/SSL Support (Recommended via Nginx)
+
+This Go proxy server deliberately does not implement its own TLS termination (e.g., handling SSL certificates directly in the Go code). It is highly recommended to run this proxy behind a mature reverse proxy like **Nginx** for SSL/TLS termination. 
+
+Using Nginx as a TLS front-end allows you to:
+- Easily manage certificates using tools like Certbot (Let's Encrypt).
+- Secure your proxy traffic over the internet without adding cryptographic overhead to the Go application.
+- Leverage Nginx's robust connection management and security features.
+
+**Important Note for Nginx Configuration:**
+- **HTTP Proxy**: Can be proxied using a standard Nginx `http` block with basic `proxy_pass`.
+- **SOCKS5 Proxy**: Because SOCKS5 is a pure TCP protocol (not HTTP), it **cannot** be routed through a standard Nginx `http` block. To securely expose the SOCKS5 proxy via Nginx, you must use Nginx's `stream` module (TCP proxying).
+
+Simply bind this Go proxy to `127.0.0.1` and configure Nginx to forward traffic to it accordingly.
+
 ## Usage / Testing
 
 Once the server is running, you can test it using `curl`.
