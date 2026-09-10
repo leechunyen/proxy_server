@@ -12,7 +12,11 @@ A lightweight, high-performance, dual-protocol proxy server written in Go. It su
   - If forwarding a plain HTTP request fails (e.g., upstream write error), the proxy responds with **502 Bad Gateway** instead of silently closing.
   - Enforce TLS (Secure Proxy) globally or on a per‑protocol basis to reject unencrypted connections.
   - Uses Constant‑Time Comparison (`crypto/subtle`) for password validation to prevent timing attacks.
-  - `pipeConns` uses explicit `bufPool.Put(buf)` after each copy to guarantee immediate buffer return before signalling completion.
+- **High Reliability & Performance**:
+  - Uses a `sync.Pool` for 32KB copy buffers to minimize GC pressure during high-throughput tunneling.
+  - TCP Keep-Alive is explicitly enabled for both client and upstream connections, preventing long-lived sessions (e.g., WebSockets) from being dropped by intermediate firewalls.
+  - Robust `Host` header preservation ensures absolute compatibility with strict upstream web servers.
+  - Safe Goroutine lifecycle management prevents memory leaks during concurrent connection handling.
 - **Authentication**: Optional username/password authentication. Supports HTTP Basic Auth and SOCKS5 User/Pass Auth (RFC 1929).
 - **Multi-User Support**: Configure multiple valid username/password pairs.
 - **Advanced Logging**: Decoupled logging system. You can toggle terminal debug logs and file-based activity logs independently.
@@ -48,12 +52,12 @@ You can also run the proxy easily via Docker using the provided `docker-compose.
    ```
 2. Start the container in the background:
    ```bash
-   docker-compose up -d --build
+   docker compose up -d --build
    ```
    
 **Persistent Data:**
 By default, the `docker-compose.yaml` uses a bind mount to store data. Upon starting, a `data` folder will be created locally (`./src/data/`). 
-You can edit the `./src/data/config.json` file from your host machine and run `docker-compose restart` to apply changes. All log files (e.g., `activity.log`) will also appear in this folder.
+You can edit the `./src/data/config.json` file from your host machine and run `docker compose restart` to apply changes. All log files (e.g., `activity.log`) will also appear in this folder.
 
 ## Configuration (`config.json`)
 
@@ -61,7 +65,7 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
 
 ```json
 {
-  "enable_debug_log": true,
+  "enable_debug_log": false,
   "port": 1080,
   "enable_socks5": true,
   "enable_http": true,
@@ -74,19 +78,15 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
   },
   "timeout_sec": 10,
   "write_log": {
-    "enable": true,
+    "enable": false,
     "path": "./activity.log"
   },
   "auth": {
-    "enable": true,
+    "enable": false,
     "users": [
       {
         "username": "user",
         "password": "pass"
-      },
-      {
-        "username": "user2",
-        "password": "pass2"
       }
     ]
   }
@@ -101,6 +101,11 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
 - `tls`:
   - `enable`: Set to `true` to enable TLS multiplexing on the main port. Requires valid certificates. When enabled, the proxy supports *both* plain-text and TLS-encrypted connections simultaneously.
   - `cert_file` / `key_file`: Path to the TLS certificate and private key.
+    > **Note**: To generate a quick self-signed certificate for testing, you can use OpenSSL:
+    > ```bash
+    > openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
+    > ```
+    > *If you are using Docker, make sure to place these files in the `./src/data/` folder so the container can access them.*
   - `force_socks5` / `force_http`: Enforces TLS on a per-protocol basis. If set to `true`, plain-text connections for that protocol will be strictly rejected. If `false`, both encrypted and unencrypted traffic are allowed on the same port.
 - `timeout_sec`: Timeout in seconds for establishing outbound connections to the target servers.
 - `write_log`: 
@@ -127,7 +132,8 @@ curl -x http://user:pass@127.0.0.1:1080 https://ifconfig.me
 ### HTTPS Proxy (TLS Encrypted)
 *(Requires `tls.enable: true`)*
 ```bash
-curl -x https://user:pass@127.0.0.1:1080 https://ifconfig.me
+# Note: Add --proxy-insecure if you are using a self-signed certificate
+curl -x https://user:pass@127.0.0.1:1080 https://ifconfig.me --proxy-insecure
 ```
 
 ### SOCKS5 Proxy

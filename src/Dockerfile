@@ -7,8 +7,8 @@ WORKDIR /app
 COPY go.mod ./
 COPY main.go ./
 
-# Build the executable
-RUN CGO_ENABLED=0 GOOS=linux go build -o proxy_server .
+# Build the executable with optimizations to reduce binary size
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o proxy_server .
 
 # Final stage
 FROM alpine:latest

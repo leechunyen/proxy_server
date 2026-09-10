@@ -185,7 +185,7 @@ func pipeConns(c1, c2 net.Conn) {
         c2.Close()
     }
 
-    done := make(chan struct{})
+    done := make(chan struct{}, 2)
 
     go func() {
         buf := bufPool.Get().([]byte)
@@ -441,7 +441,7 @@ func handleHTTP(br *bufio.Reader, client net.Conn, cfg Config) {
             if !isConnect {
                 // ALWAYS inject a clean, standardized Host header for plain HTTP requests
                 if parsedURL != nil {
-                    rawReq = append(rawReq, []byte(fmt.Sprintf("Host: %s\r\n", targetHostPort))...)
+                    rawReq = append(rawReq, []byte(fmt.Sprintf("Host: %s\r\n", parsedURL.Host))...)
                 }
                 if !isUpgrade {
                     rawReq = append(rawReq, []byte("Connection: close\r\n")...)
@@ -521,7 +521,11 @@ func handleHTTP(br *bufio.Reader, client net.Conn, cfg Config) {
     userStr = fmt.Sprintf("%s@%s", userStr, clientAddr)
 
     // Connect to target
-    remote, err := net.DialTimeout("tcp", targetHostPort, time.Duration(cfg.TimeoutSec)*time.Second)
+    dialer := net.Dialer{
+        Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
+        KeepAlive: 30 * time.Second,
+    }
+    remote, err := dialer.Dial("tcp", targetHostPort)
     if err != nil {
         logDebug("[%s] [%s] [FAIL] → %s | upstream unreachable: %v", protocolStr, userStr, targetHostPort, err)
         sendHTTPError(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -545,19 +549,8 @@ func handleHTTP(br *bufio.Reader, client net.Conn, cfg Config) {
             return
         }
         
-        remote.SetReadDeadline(time.Now().Add(time.Duration(cfg.TimeoutSec) * time.Second))
-        remoteBr := bufio.NewReader(remote)
-        statusLine, err := remoteBr.ReadString('\n')
-        if err != nil {
-            logDebug("[%s] [%s] [FAIL] → %s | backend read error: %v", protocolStr, userStr, targetHostPort, err)
-            sendHTTPError(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            remote.Close()
-            return
-        }
-        logDebug("[%s] [%s] [SUCCESS] → %s | %s", protocolStr, userStr, targetHostPort, strings.TrimSpace(statusLine))
-        
-        remote.SetDeadline(time.Time{})
-        remoteWrapper = &connWithBuffer{Conn: remote, r: io.MultiReader(strings.NewReader(statusLine), remoteBr)}
+        logDebug("[%s] [%s] [SUCCESS] → %s | request forwarded", protocolStr, userStr, targetHostPort)
+        remoteWrapper = &connWithBuffer{Conn: remote, r: remote}
     }
     
     wrapper = &connWithBuffer{Conn: client, r: io.MultiReader(br, client)}
@@ -617,8 +610,6 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
         }
     }
 
-    client.Write([]byte{0x05, chosen})
-    
     clientAddr := client.RemoteAddr().String()
     
     isSecure := false
@@ -631,9 +622,12 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
     }
 
     if chosen == 0xFF {
+        client.Write([]byte{0x05, 0xFF})
         logDebug("[%s] [unknown@%s] [AUTH] | missing auth (client methods: %v)", protoStr, clientAddr, methods)
         return
     }
+    
+    client.Write([]byte{0x05, chosen})
 
     var authUser string
     if chosen == 0x02 {
@@ -669,7 +663,11 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
     }
     userStr = fmt.Sprintf("%s@%s", userStr, clientAddr)
 
-    remote, err := net.DialTimeout("tcp", addr, time.Duration(cfg.TimeoutSec)*time.Second)
+    dialer := net.Dialer{
+        Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
+        KeepAlive: 30 * time.Second,
+    }
+    remote, err := dialer.Dial("tcp", addr)
     if err != nil {
         logDebug("[%s CONNECT] [%s] [FAIL] → %s | upstream unreachable: %v", protoStr, userStr, addr, err)
         client.Write([]byte{0x05, 0x05, 0, 0x01, 0, 0, 0, 0, 0, 0})
