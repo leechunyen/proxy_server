@@ -8,7 +8,9 @@ package main
 
 import (
     "bufio"
+    "bytes"
     "crypto/subtle"
+    "crypto/tls"
     "encoding/base64"
     "encoding/json"
     "errors"
@@ -18,8 +20,11 @@ import (
     "net"
     "net/url"
     "os"
+    "os/signal"
+    "strconv"
     "strings"
     "sync"
+    "syscall"
     "time"
 )
 
@@ -83,11 +88,20 @@ type AuthConfig struct {
     Users  []User `json:"users"`
 }
 
+type TLSConfig struct {
+    Enable      bool   `json:"enable"`
+    CertFile    string `json:"cert_file"`
+    KeyFile     string `json:"key_file"`
+    ForceSocks5 bool   `json:"force_socks5"`
+    ForceHttp   bool   `json:"force_http"`
+}
+
 type Config struct {
     EnableDebug   bool           `json:"enable_debug_log"`
     Port          int            `json:"port"`
     EnableSocks5  bool           `json:"enable_socks5"`
     EnableHTTP    bool           `json:"enable_http"`
+    TLS           TLSConfig      `json:"tls"`
     TimeoutSec    int            `json:"timeout_sec"`
     WriteLog      WriteLogConfig `json:"write_log"`
     Auth          AuthConfig     `json:"auth"`
@@ -99,6 +113,13 @@ func defaultConfig() Config {
         Port:          1080,
         EnableSocks5:  true,
         EnableHTTP:    true,
+        TLS: TLSConfig{
+            Enable:      false,
+            CertFile:    "./server.crt",
+            KeyFile:     "./server.key",
+            ForceSocks5: true,
+            ForceHttp:   true,
+        },
         TimeoutSec:    10,
         WriteLog: WriteLogConfig{
             Enable: false,
@@ -122,28 +143,27 @@ func loadOrCreateConfig() Config {
     // Read existing file if it exists
     data, err := os.ReadFile(cfgFile)
     if err == nil {
-        // Merge existing config into defaults
         if err := json.Unmarshal(data, &cfg); err != nil {
             log.Fatalf("failed to parse %s: %v", cfgFile, err)
         }
-    } else if !os.IsNotExist(err) {
+        log.Printf("loaded %s", cfgFile)
+    } else if os.IsNotExist(err) {
+        // Write default config to file since it doesn't exist
+        newData, _ := json.MarshalIndent(cfg, "", "  ")
+        if err := os.WriteFile(cfgFile, newData, 0600); err != nil {
+            log.Fatalf("cannot write %s: %v", cfgFile, err)
+        }
+        log.Printf("generated default %s", cfgFile)
+    } else {
         log.Fatalf("cannot read %s: %v", cfgFile, err)
     }
 
+    // JSON Unmarshal zero-value fallback safety
     if cfg.TimeoutSec <= 0 {
         cfg.TimeoutSec = 10
     }
-
-    // Write back to file to ensure missing fields are added
-    newData, _ := json.MarshalIndent(cfg, "", "  ")
-    if err := os.WriteFile(cfgFile, newData, 0644); err != nil {
-        log.Fatalf("cannot write %s: %v", cfgFile, err)
-    }
-    
-    if os.IsNotExist(err) {
-        log.Printf("generated default %s", cfgFile)
-    } else {
-        log.Printf("loaded and updated %s", cfgFile)
+    if cfg.Port <= 0 {
+        cfg.Port = 1080
     }
 
     return cfg
@@ -156,12 +176,37 @@ var bufPool = sync.Pool{
     New: func() interface{} { return make([]byte, 32*1024) }, // 32KB buffers
 }
 
-func copyBuffered(dst net.Conn, src net.Conn) {
-    defer dst.Close()
-    defer src.Close()
-    buf := bufPool.Get().([]byte)
-    defer bufPool.Put(buf)
-    io.CopyBuffer(dst, src, buf)
+func pipeConns(c1, c2 net.Conn) {
+    var once sync.Once
+    closeConns := func() {
+        c1.SetDeadline(time.Now())
+        c2.SetDeadline(time.Now())
+        c1.Close()
+        c2.Close()
+    }
+
+    done := make(chan struct{})
+
+    go func() {
+        buf := bufPool.Get().([]byte)
+        // Mask underlying socket methods (e.g., SyscallConn, ReadFrom) to prevent splice(2).
+        // This guarantees io.CopyBuffer uses our custom connWithBuffer.Read() and doesn't bypass the prefetched MultiReader.
+        io.CopyBuffer(struct{ io.Writer }{c1}, struct{ io.Reader }{c2}, buf)
+        bufPool.Put(buf) // return immediately after use, before closing or signaling
+        once.Do(closeConns)
+        done <- struct{}{}
+    }()
+
+    go func() {
+        buf := bufPool.Get().([]byte)
+        io.CopyBuffer(struct{ io.Writer }{c2}, struct{ io.Reader }{c1}, buf)
+        bufPool.Put(buf) // return immediately after use, before closing or signaling
+        once.Do(closeConns)
+        done <- struct{}{}
+    }()
+
+    <-done
+    <-done
 }
 
 // -----------------------
@@ -206,34 +251,94 @@ func parseBasicAuth(header string) (user, pass string, ok bool) {
 // -----------------------
 // Main handling – protocol detection
 // -----------------------
-func handleConn(client net.Conn, cfg Config) {
-    // Set a read deadline to obtain the first byte quickly
-    client.SetReadDeadline(time.Now().Add(time.Duration(cfg.TimeoutSec) * time.Second))
+func handleConn(client net.Conn, cfg Config, tlsConf *tls.Config) {
+    // Guarantee the raw TCP socket is always released, regardless of exit path.
+    defer client.Close()
+
+    // Set a full deadline (read + write) covering the entire handshake phase.
+    // This guards the initial peek, the full HTTP-header / SOCKS5-subnegotiation
+    // loop, and the TLS inner-peek — preventing Slowloris-style goroutine hangs.
+    // Handlers clear this via client.SetDeadline(time.Time{}) just before pipeConns.
+    timeout := time.Duration(cfg.TimeoutSec) * time.Second
+    client.SetDeadline(time.Now().Add(timeout))
     peek := make([]byte, 1)
     n, err := client.Read(peek)
     if err != nil || n == 0 {
-        client.Close()
         return
     }
-    client.SetReadDeadline(time.Time{}) // clear deadline
+    // Do NOT clear the deadline here — keep it active to guard the full handshake.
 
-    // Put the peeked byte back using a buffered reader
-    br := bufio.NewReader(io.MultiReader(strings.NewReader(string(peek)), client))
+    if peek[0] == 0x16 { // TLS ClientHello
+        if !cfg.TLS.Enable || tlsConf == nil {
+            clientAddr := client.RemoteAddr().String()
+            logDebug("[TLS] [unknown@%s] [WARN] | connection attempted but TLS is disabled", clientAddr)
+            return
+        }
 
-    // SOCKS5 starts with 0x05, HTTP CONNECT starts with 'C' (0x43) etc.
-    if peek[0] == 0x05 {
+        // Wrap the connection, including the peeked byte
+        rawConn := &connWithBuffer{Conn: client, r: io.MultiReader(bytes.NewReader(peek), client)}
+        tlsConn := tls.Server(rawConn, tlsConf)
+
+        // Perform TLS handshake. The overall client.SetDeadline(timeout) set above
+        // protects this call through connWithBuffer — no separate per-step deadline
+        // needed. On failure, tlsConn.Close() sends the TLS close_notify alert;
+        // the outer defer then closes the raw TCP socket, ensuring no fd leak.
+        err = tlsConn.Handshake()
+        if err != nil {
+            clientAddr := client.RemoteAddr().String()
+            logDebug("[TLS] [unknown@%s] [ERROR] | handshake failed: %v", clientAddr, err)
+            tlsConn.Close() // sends TLS alert; defer closes underlying TCP
+            return
+        }
+
+        // Peek inside the TLS tunnel
+        innerPeek := make([]byte, 1)
+        n, err = tlsConn.Read(innerPeek)
+        if err != nil || n == 0 {
+            tlsConn.Close() // sends TLS alert; defer closes underlying TCP
+            return
+        }
+
+        br := bufio.NewReader(io.MultiReader(bytes.NewReader(innerPeek), tlsConn))
+        if innerPeek[0] == 0x05 {
+            if cfg.EnableSocks5 {
+                handleSocks5(br, tlsConn, cfg)
+            } else {
+                tlsConn.Close()
+            }
+        } else {
+            if cfg.EnableHTTP {
+                handleHTTP(br, tlsConn, cfg)
+            } else {
+                tlsConn.Close()
+            }
+        }
+        return
+    }
+
+    // Plaintext connections
+    br := bufio.NewReader(io.MultiReader(bytes.NewReader(peek), client))
+    if peek[0] == 0x05 { // Plain SOCKS5
+        if cfg.TLS.Enable && cfg.TLS.ForceSocks5 {
+            clientAddr := client.RemoteAddr().String()
+            logDebug("[SOCKS5] [unknown@%s] [WARN] | rejected plain SOCKS5 connection (TLS required)", clientAddr)
+            return
+        }
         if cfg.EnableSocks5 {
             handleSocks5(br, client, cfg)
         } else {
-            logInfo("[WARN] SOCKS5 request received but disabled in config")
-            client.Close()
+            logInfo("[SYSTEM] [WARN] | SOCKS5 request received but disabled in config")
         }
-    } else {
+    } else { // Plain HTTP
+        if cfg.TLS.Enable && cfg.TLS.ForceHttp {
+            clientAddr := client.RemoteAddr().String()
+            logDebug("[HTTP] [unknown@%s] [WARN] | rejected plain HTTP connection (TLS required)", clientAddr)
+            return
+        }
         if cfg.EnableHTTP {
             handleHTTP(br, client, cfg)
         } else {
-            logInfo("[WARN] HTTP CONNECT request received but disabled in config")
-            client.Close()
+            logInfo("[SYSTEM] [WARN] | HTTP request received but disabled in config")
         }
     }
 }
@@ -243,7 +348,31 @@ type connWithBuffer struct {
     r io.Reader
 }
 
+// Read serves buffered/pre-peeked bytes first, then falls through to the real Conn.
 func (c *connWithBuffer) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// Close explicitly forwards to the underlying net.Conn, ensuring the real socket
+// is released and not shadowed by any future embedding changes.
+func (c *connWithBuffer) Close() error { return c.Conn.Close() }
+
+// The three Deadline methods are forwarded explicitly so that pipeConns calling
+// c1.SetDeadline(time.Now()) on a *connWithBuffer correctly reaches the underlying
+// net.Conn (or tls.Conn), unblocking its blocking Read/Write immediately.
+func (c *connWithBuffer) SetDeadline(t time.Time) error      { return c.Conn.SetDeadline(t) }
+func (c *connWithBuffer) SetReadDeadline(t time.Time) error  { return c.Conn.SetReadDeadline(t) }
+func (c *connWithBuffer) SetWriteDeadline(t time.Time) error { return c.Conn.SetWriteDeadline(t) }
+
+// sendHTTPError writes an HTTP error response and performs a TCP half-close.
+// This prevents a TCP RST when the client is still sending data, ensuring the response is delivered.
+func sendHTTPError(client net.Conn, resp string) {
+    fmt.Fprint(client, resp)
+    type closeWriter interface {
+        CloseWrite() error
+    }
+    if cw, ok := client.(closeWriter); ok {
+        cw.CloseWrite()
+    }
+}
 
 // -----------------------
 // HTTP/HTTPS (CONNECT) handling
@@ -252,38 +381,96 @@ func handleHTTP(br *bufio.Reader, client net.Conn, cfg Config) {
     var rawReq []byte
     line, err := br.ReadString('\n')
     if err != nil {
-        client.Close()
         return
     }
-    rawReq = append(rawReq, []byte(line)...)
 
-    method, hostPort, _, ok := parseRequestLine(line)
+    method, hostPort, proto, ok := parseRequestLine(line)
     if !ok {
-        client.Close()
         return
     }
     isConnect := method == "CONNECT"
 
+    // Ensure non-CONNECT requests have a scheme for url.Parse to work correctly
+    if !isConnect && !strings.Contains(hostPort, "://") {
+        hostPort = "http://" + hostPort
+    }
+
+    var parsedURL *url.URL
+    var targetHostPort string
+    // Rewrite request line for non-CONNECT requests
+    if isConnect {
+        rawReq = append(rawReq, []byte(line)...)
+        targetHostPort = hostPort
+    } else {
+        var err error
+        parsedURL, err = url.Parse(hostPort)
+        if err != nil {
+            sendHTTPError(client, "HTTP/1.1 400 Bad Request\r\n\r\n")
+            return
+        }
+        reqURI := parsedURL.Path
+        if reqURI == "" {
+            reqURI = "/"
+        }
+        if parsedURL.RawQuery != "" {
+            reqURI += "?" + parsedURL.RawQuery
+        }
+        rewrittenLine := fmt.Sprintf("%s %s %s\r\n", method, reqURI, proto)
+        rawReq = append(rawReq, []byte(rewrittenLine)...)
+        
+        targetHostPort = parsedURL.Host
+        if parsedURL.Port() == "" {
+            if parsedURL.Scheme == "https" {
+                targetHostPort = net.JoinHostPort(parsedURL.Hostname(), "443")
+            } else {
+                targetHostPort = net.JoinHostPort(parsedURL.Hostname(), "80")
+            }
+        }
+    }
+
     // Read headers
     headers := make(map[string]string)
+    isUpgrade := false
     for {
         hline, err := br.ReadString('\n')
         if err != nil {
-            client.Close()
             return
         }
         trimHline := strings.TrimSpace(hline)
         if trimHline == "" { // end of headers
-            rawReq = append(rawReq, []byte(hline)...)
+            if !isConnect {
+                // ALWAYS inject a clean, standardized Host header for plain HTTP requests
+                if parsedURL != nil {
+                    rawReq = append(rawReq, []byte(fmt.Sprintf("Host: %s\r\n", targetHostPort))...)
+                }
+                if !isUpgrade {
+                    rawReq = append(rawReq, []byte("Connection: close\r\n")...)
+                }
+            }
+            rawReq = append(rawReq, []byte("\r\n")...)
             break
         }
         
         isProxyHeader := false
-        parts := strings.SplitN(trimHline, ":", 2)
+        parts := strings.SplitN(hline, ":", 2)
         if len(parts) == 2 {
             headerName := strings.TrimSpace(strings.ToLower(parts[0]))
-            headers[headerName] = strings.TrimSpace(parts[1])
-            if headerName == "proxy-authorization" || headerName == "proxy-connection" {
+            headerVal := strings.TrimSpace(parts[1])
+            if existing, exists := headers[headerName]; exists {
+                headers[headerName] = existing + ", " + headerVal
+            } else {
+                headers[headerName] = headerVal
+            }
+            
+            if headerName == "connection" && strings.Contains(strings.ToLower(headerVal), "upgrade") {
+                isUpgrade = true
+            }
+            
+            // Strip all Proxy-* headers, keep-alive, and the original Host header for non-CONNECT.
+            if strings.HasPrefix(headerName, "proxy-") ||
+                (!isConnect && headerName == "keep-alive") ||
+                (!isConnect && headerName == "host") || // force drop original Host header to replace with standard one
+                (!isConnect && headerName == "connection" && !isUpgrade) {
                 isProxyHeader = true
             }
         }
@@ -293,82 +480,104 @@ func handleHTTP(br *bufio.Reader, client net.Conn, cfg Config) {
         }
     }
 
+    isSecure := false
+    if _, ok := client.(*tls.Conn); ok {
+        isSecure = true
+    }
+
+    protocolStr := "HTTP CONNECT"
+    if !isConnect {
+        protocolStr = "HTTP " + method
+    }
+    if isSecure {
+        protocolStr = "TLS " + protocolStr
+    } else {
+        protocolStr = "Plain " + protocolStr
+    }
+
     // Authentication check
     var authUser string
+    clientAddr := client.RemoteAddr().String()
     if cfg.Auth.Enable {
         authHeader, ok := headers["proxy-authorization"]
         if !ok {
-            logDebug("HTTP CONNECT missing auth (attempting: %s)", hostPort)
-            fmt.Fprintf(client, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n")
-            client.Close()
+            logDebug("[%s] [unknown@%s] [AUTH] | missing auth (attempting: %s)", protocolStr, clientAddr, hostPort)
+            sendHTTPError(client, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n")
             return
         }
         user, pass, ok := parseBasicAuth(authHeader)
         if !ok || !checkAuth(user, pass, cfg) {
-            logDebug("HTTP CONNECT auth failed for user: %s", user)
-            fmt.Fprintf(client, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n")
-            client.Close()
+            logDebug("[%s] [unknown@%s] [AUTH] | auth failed for user: %s", protocolStr, clientAddr, user)
+            sendHTTPError(client, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n")
             return
         }
         authUser = user
-    }
-
-    var targetHostPort string
-    if isConnect {
-        targetHostPort = hostPort
-    } else {
-        u, err := url.Parse(hostPort)
-        if err != nil {
-            client.Close()
-            return
-        }
-        targetHostPort = u.Host
-        if !strings.Contains(targetHostPort, ":") {
-            if u.Scheme == "https" {
-                targetHostPort += ":443"
-            } else {
-                targetHostPort += ":80"
-            }
-        }
     }
 
     userStr := "anonymous"
     if authUser != "" {
         userStr = authUser
     }
-    
-    protocolStr := "HTTP CONNECT"
-    if !isConnect {
-        protocolStr = "HTTP " + method
-    }
-    logDebug("%s [%s] attempting to connect to: %s", protocolStr, userStr, targetHostPort)
+    userStr = fmt.Sprintf("%s@%s", userStr, clientAddr)
 
     // Connect to target
     remote, err := net.DialTimeout("tcp", targetHostPort, time.Duration(cfg.TimeoutSec)*time.Second)
     if err != nil {
-        fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        client.Close()
+        logDebug("[%s] [%s] [FAIL] → %s | upstream unreachable: %v", protocolStr, userStr, targetHostPort, err)
+        sendHTTPError(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         return
     }
 
+    client.SetDeadline(time.Time{})
+
+    var wrapper *connWithBuffer
+    var remoteWrapper *connWithBuffer
+    
     if isConnect {
+        logDebug("[%s] [%s] [SUCCESS] → %s | tunnel established", protocolStr, userStr, targetHostPort)
         fmt.Fprintf(client, "HTTP/1.1 200 Connection Established\r\nProxy-Agent: GoDualProxy\r\n\r\n")
+        remoteWrapper = &connWithBuffer{Conn: remote, r: remote}
     } else {
-        remote.Write(rawReq)
+        if _, err := remote.Write(rawReq); err != nil {
+            logDebug("[%s] [%s] [FAIL] → %s | write to upstream failed: %v", protocolStr, userStr, targetHostPort, err)
+            sendHTTPError(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            remote.Close()
+            return
+        }
+        
+        remote.SetReadDeadline(time.Now().Add(time.Duration(cfg.TimeoutSec) * time.Second))
+        remoteBr := bufio.NewReader(remote)
+        statusLine, err := remoteBr.ReadString('\n')
+        if err != nil {
+            logDebug("[%s] [%s] [FAIL] → %s | backend read error: %v", protocolStr, userStr, targetHostPort, err)
+            sendHTTPError(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            remote.Close()
+            return
+        }
+        logDebug("[%s] [%s] [SUCCESS] → %s | %s", protocolStr, userStr, targetHostPort, strings.TrimSpace(statusLine))
+        
+        remote.SetDeadline(time.Time{})
+        remoteWrapper = &connWithBuffer{Conn: remote, r: io.MultiReader(strings.NewReader(statusLine), remoteBr)}
     }
+    
+    wrapper = &connWithBuffer{Conn: client, r: io.MultiReader(br, client)}
 
     // Pipe data, ensuring we don't lose any prefetched data in br
-    wrapper := &connWithBuffer{Conn: client, r: io.MultiReader(br, client)}
-    go copyBuffered(remote, wrapper)
-    copyBuffered(client, remote)
+    pipeConns(wrapper, remoteWrapper)
 }
 
 func parseRequestLine(line string) (method, hostPort, proto string, ok bool) {
-    parts := strings.Split(strings.TrimSpace(line), " ")
-    if len(parts) < 3 {
+    line = strings.TrimSpace(line)
+    method, rest, found := strings.Cut(line, " ")
+    if !found {
         return "", "", "", false
     }
-    return strings.ToUpper(parts[0]), parts[1], parts[2], true
+    rest = strings.TrimLeft(rest, " ")
+    hostPort, proto, found = strings.Cut(rest, " ")
+    if !found {
+        return "", "", "", false
+    }
+    return strings.ToUpper(method), hostPort, strings.TrimLeft(proto, " "), true
 }
 
 // -----------------------
@@ -379,18 +588,15 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
     // Read the version byte first (which was put back by the peeker)
     ver, err := br.ReadByte()
     if err != nil || ver != 0x05 {
-        client.Close()
         return
     }
     // Now read NMETHODS
     nMethods, err := br.ReadByte()
     if err != nil {
-        client.Close()
         return
     }
     methods := make([]byte, nMethods)
     if _, err := io.ReadFull(br, methods); err != nil {
-        client.Close()
         return
     }
     // Choose method based on what client supports and what we require
@@ -413,9 +619,19 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
 
     client.Write([]byte{0x05, chosen})
     
+    clientAddr := client.RemoteAddr().String()
+    
+    isSecure := false
+    if _, ok := client.(*tls.Conn); ok {
+        isSecure = true
+    }
+    protoStr := "Plain SOCKS5"
+    if isSecure {
+        protoStr = "TLS SOCKS5"
+    }
+
     if chosen == 0xFF {
-        logDebug("SOCKS5 missing auth (client methods: %v)", methods)
-        client.Close()
+        logDebug("[%s] [unknown@%s] [AUTH] | missing auth (client methods: %v)", protoStr, clientAddr, methods)
         return
     }
 
@@ -425,11 +641,10 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
         authUser, err = socks5UserPassAuth(br, client, cfg)
         if err != nil {
             if err.Error() == "invalid credentials" {
-                logDebug("SOCKS5 auth failed for user: %s", authUser)
+                logDebug("[%s] [unknown@%s] [AUTH] | auth failed for user: %s", protoStr, clientAddr, authUser)
             } else {
-                logDebug("SOCKS5 auth error: %v", err)
+                logDebug("[%s] [unknown@%s] [AUTH] | auth error: %v", protoStr, clientAddr, err)
             }
-            client.Close()
             return
         }
     }
@@ -437,17 +652,14 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
     // Request
     hdr := make([]byte, 4)
     if _, err := io.ReadFull(br, hdr); err != nil {
-        client.Close()
         return
     }
     if hdr[0] != 0x05 || hdr[1] != 0x01 { // only CONNECT
         client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-        client.Close()
         return
     }
     addr, err := readSocks5Address(br, hdr[3])
     if err != nil {
-        client.Close()
         return
     }
     
@@ -455,20 +667,26 @@ func handleSocks5(br *bufio.Reader, client net.Conn, cfg Config) {
     if authUser != "" {
         userStr = authUser
     }
-    logDebug("SOCKS5 CONNECT [%s] attempting to connect to: %s", userStr, addr)
+    userStr = fmt.Sprintf("%s@%s", userStr, clientAddr)
 
     remote, err := net.DialTimeout("tcp", addr, time.Duration(cfg.TimeoutSec)*time.Second)
     if err != nil {
+        logDebug("[%s CONNECT] [%s] [FAIL] → %s | upstream unreachable: %v", protoStr, userStr, addr, err)
         client.Write([]byte{0x05, 0x05, 0, 0x01, 0, 0, 0, 0, 0, 0})
-        client.Close()
         return
     }
+    
+    // Clear Handshake Deadline early
+    client.SetDeadline(time.Time{})
+    remote.SetDeadline(time.Time{})
+
     // Success reply
+    logDebug("[%s CONNECT] [%s] [SUCCESS] → %s | tunnel established", protoStr, userStr, addr)
     client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
     
+    // Pipe data
     wrapper := &connWithBuffer{Conn: client, r: io.MultiReader(br, client)}
-    go copyBuffered(remote, wrapper)
-    copyBuffered(client, remote)
+    pipeConns(wrapper, remote)
 }
 
 func readSocks5Address(br *bufio.Reader, atyp byte) (string, error) {
@@ -489,7 +707,7 @@ func readSocks5Address(br *bufio.Reader, atyp byte) (string, error) {
         if _, err := io.ReadFull(br, dom); err != nil {
             return "", err
         }
-        host = string(dom)
+        host = string(dom) // RFC 1928 §5: domain is a raw string; net.JoinHostPort handles formatting
     case 0x04: // IPv6
         ip := make([]byte, 16)
         if _, err := io.ReadFull(br, ip); err != nil {
@@ -504,7 +722,8 @@ func readSocks5Address(br *bufio.Reader, atyp byte) (string, error) {
         return "", err
     }
     port := int(portBytes[0])<<8 | int(portBytes[1])
-    portStr := fmt.Sprintf("%d", port)
+    portStr := strconv.Itoa(port)
+    
     return net.JoinHostPort(host, portStr), nil
 }
 
@@ -519,6 +738,10 @@ func socks5UserPassAuth(br *bufio.Reader, client net.Conn, cfg Config) (string, 
         return "", errors.New("unsupported auth version")
     }
     ulen := int(hdr[1])
+    if ulen == 0 {
+        client.Write([]byte{0x01, 0xFF})
+        return "", errors.New("invalid username length")
+    }
     uname := make([]byte, ulen)
     if _, err := io.ReadFull(br, uname); err != nil {
         return "", err
@@ -526,6 +749,10 @@ func socks5UserPassAuth(br *bufio.Reader, client net.Conn, cfg Config) (string, 
     plen, err := br.ReadByte()
     if err != nil {
         return "", err
+    }
+    if plen == 0 {
+        client.Write([]byte{0x01, 0xFF})
+        return "", errors.New("invalid password length")
     }
     passwd := make([]byte, plen)
     if _, err := io.ReadFull(br, passwd); err != nil {
@@ -553,22 +780,46 @@ func main() {
         }
     }()
 
+    var tlsConf *tls.Config
+    if cfg.TLS.Enable {
+        cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+        if err != nil {
+            log.Fatalf("failed to load TLS cert/key: %v", err)
+        }
+        tlsConf = &tls.Config{Certificates: []tls.Certificate{cert}}
+        logInfo("[SYSTEM] [INFO] | TLS is enabled (cert: %s, key: %s)", cfg.TLS.CertFile, cfg.TLS.KeyFile)
+    }
+
     addr := fmt.Sprintf(":%d", cfg.Port)
     listener, err := net.Listen("tcp", addr)
     if err != nil {
         log.Fatalf("listen %s: %v", addr, err)
     }
-    logInfo("Proxy listening on %s (auth=%v)\n", addr, cfg.Auth.Enable)
+    
+    // Graceful Shutdown
+    go func() {
+        c := make(chan os.Signal, 1)
+        signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+        <-c
+        logInfo("[SYSTEM] [INFO] | Shutting down proxy server gracefully...")
+        listener.Close()
+    }()
+
+    logInfo("[SYSTEM] [INFO] | Proxy listening on %s (auth=%v)\n", addr, cfg.Auth.Enable)
     for {
         conn, err := listener.Accept()
         if err != nil {
-            logInfo("accept error: %v\n", err)
+            if errors.Is(err, net.ErrClosed) {
+                break
+            }
+            logInfo("[SYSTEM] [ERROR] | accept error: %v\n", err)
             continue
         }
         if tcp, ok := conn.(*net.TCPConn); ok {
             tcp.SetKeepAlive(true)
             tcp.SetKeepAlivePeriod(30 * time.Second)
         }
-        go handleConn(conn, cfg)
+        go handleConn(conn, cfg, tlsConf)
     }
+    logInfo("[SYSTEM] [INFO] | Server exited.")
 }

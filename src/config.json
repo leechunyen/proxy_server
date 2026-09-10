@@ -1,19 +1,30 @@
 {
-  "enable_debug_log": false,
+  "enable_debug_log": true,
   "port": 1080,
   "enable_socks5": true,
   "enable_http": true,
+  "tls": {
+    "enable": true,
+    "cert_file": "./server.crt",
+    "key_file": "./server.key",
+    "force_socks5": false,
+    "force_http": false
+  },
   "timeout_sec": 10,
   "write_log": {
     "enable": false,
     "path": "./activity.log"
   },
   "auth": {
-    "enable": false,
+    "enable": true,
     "users": [
       {
         "username": "user",
         "password": "pass"
+      },
+      {
+        "username": "user2",
+        "password": "pass2"
       }
     ]
   }

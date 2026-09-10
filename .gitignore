@@ -1,2 +1,4 @@
 **.DS_Store
 /src/activity.log
+src/server.crt
+src/server.key

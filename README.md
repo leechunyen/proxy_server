@@ -5,10 +5,14 @@ A lightweight, high-performance, dual-protocol proxy server written in Go. It su
 ## Features
 
 - **Dual-Protocol Auto-Detection**: Run HTTP/HTTPS and SOCKS5 proxies on a single port (e.g., `1080`).
+- **TLS Multiplexing**: Supercharge your port to support both plain-text and TLS-encrypted connections simultaneously. Automatically routes traffic based on the TLS ClientHello handshake.
 - **Comprehensive HTTP Support**: Supports both HTTPS tunnels (`CONNECT` method) and standard plain HTTP requests (`GET`, `POST`, etc.).
 - **Security First**:
   - Automatically strips `Proxy-Authorization` and `Proxy-Connection` headers from plain HTTP requests to prevent credential leaks to destination servers.
-  - Uses Constant-Time Comparison (`crypto/subtle`) for password validation to prevent timing attacks.
+  - If forwarding a plain HTTP request fails (e.g., upstream write error), the proxy responds with **502 Bad Gateway** instead of silently closing.
+  - Enforce TLS (Secure Proxy) globally or on a per‑protocol basis to reject unencrypted connections.
+  - Uses Constant‑Time Comparison (`crypto/subtle`) for password validation to prevent timing attacks.
+  - `pipeConns` uses explicit `bufPool.Put(buf)` after each copy to guarantee immediate buffer return before signalling completion.
 - **Authentication**: Optional username/password authentication. Supports HTTP Basic Auth and SOCKS5 User/Pass Auth (RFC 1929).
 - **Multi-User Support**: Configure multiple valid username/password pairs.
 - **Advanced Logging**: Decoupled logging system. You can toggle terminal debug logs and file-based activity logs independently.
@@ -61,6 +65,13 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
   "port": 1080,
   "enable_socks5": true,
   "enable_http": true,
+  "tls": {
+    "enable": false,
+    "cert_file": "./server.crt",
+    "key_file": "./server.key",
+    "force_socks5": true,
+    "force_http": true
+  },
   "timeout_sec": 10,
   "write_log": {
     "enable": true,
@@ -87,6 +98,10 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
 - `port`: The port the proxy server will listen on.
 - `enable_socks5`: Enable or disable the SOCKS5 protocol handler.
 - `enable_http`: Enable or disable the HTTP/HTTPS protocol handler.
+- `tls`:
+  - `enable`: Set to `true` to enable TLS multiplexing on the main port. Requires valid certificates. When enabled, the proxy supports *both* plain-text and TLS-encrypted connections simultaneously.
+  - `cert_file` / `key_file`: Path to the TLS certificate and private key.
+  - `force_socks5` / `force_http`: Enforces TLS on a per-protocol basis. If set to `true`, plain-text connections for that protocol will be strictly rejected. If `false`, both encrypted and unencrypted traffic are allowed on the same port.
 - `timeout_sec`: Timeout in seconds for establishing outbound connections to the target servers.
 - `write_log`: 
   - `enable`: Set to `true` to append all logs (including debug logs) to a file.
@@ -95,26 +110,11 @@ You can customize the proxy behavior by editing the auto-generated `config.json`
   - `enable`: Set to `true` to enforce username/password authentication for all connections.
   - `users`: An array of JSON objects containing `username` and `password` for authorized clients.
 
-## TLS/SSL Support (Recommended via Nginx)
-
-This Go proxy server deliberately does not implement its own TLS termination (e.g., handling SSL certificates directly in the Go code). It is highly recommended to run this proxy behind a mature reverse proxy like **Nginx** for SSL/TLS termination. 
-
-Using Nginx as a TLS front-end allows you to:
-- Easily manage certificates using tools like Certbot (Let's Encrypt).
-- Secure your proxy traffic over the internet without adding cryptographic overhead to the Go application.
-- Leverage Nginx's robust connection management and security features.
-
-**Important Note for Nginx Configuration:**
-- **HTTP Proxy**: Can be proxied using a standard Nginx `http` block with basic `proxy_pass`.
-- **SOCKS5 Proxy**: Because SOCKS5 is a pure TCP protocol (not HTTP), it **cannot** be routed through a standard Nginx `http` block. To securely expose the SOCKS5 proxy via Nginx, you must use Nginx's `stream` module (TCP proxying).
-
-Simply bind this Go proxy to `127.0.0.1` and configure Nginx to forward traffic to it accordingly.
-
 ## Usage / Testing
 
 Once the server is running, you can test it using `curl`.
 
-### HTTP Proxy
+### HTTP Proxy (Plain-Text)
 **Without Authentication:**
 ```bash
 curl -x http://127.0.0.1:1080 https://ifconfig.me
@@ -124,13 +124,17 @@ curl -x http://127.0.0.1:1080 https://ifconfig.me
 curl -x http://user:pass@127.0.0.1:1080 https://ifconfig.me
 ```
 
-### SOCKS5 Proxy
-**Without Authentication:**
+### HTTPS Proxy (TLS Encrypted)
+*(Requires `tls.enable: true`)*
 ```bash
-curl -x socks5://127.0.0.1:1080 https://ifconfig.me
+curl -x https://user:pass@127.0.0.1:1080 https://ifconfig.me
 ```
-**With Authentication:**
+
+### SOCKS5 Proxy
+**Plain SOCKS5:**
 ```bash
 curl -x socks5://user:pass@127.0.0.1:1080 https://ifconfig.me
 ```
+**TLS Encrypted SOCKS5 (Requires `tls.enable: true`):**
+*(Note: standard `curl` may not natively support SOCKS5 over TLS without additional tools like `stunnel`, but compatible secure clients will work seamlessly.)*
 
