@@ -144,3 +144,17 @@ curl -x socks5://user:pass@127.0.0.1:1080 https://ifconfig.me
 **TLS Encrypted SOCKS5 (Requires `tls.enable: true`):**
 *(Note: standard `curl` may not natively support SOCKS5 over TLS without additional tools like `stunnel`, but compatible secure clients will work seamlessly.)*
 
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Support
+
+If you find this project helpful, you can support it here:
+
+<a href="https://buymeacoffee.com/cylee99" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
